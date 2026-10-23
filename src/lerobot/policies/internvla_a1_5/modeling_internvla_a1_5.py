@@ -1472,6 +1472,37 @@ class InternVLAA15Policy(PreTrainedPolicy):
                     del metadata[key]
         return state
 
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        """Load student weights without replacing the externally loaded video teacher.
+
+        Legacy A1.5 checkpoints contain ``model.wan_video_model.*`` tensors, while
+        current checkpoints intentionally exclude them.  The configured WAN
+        teacher is loaded during model construction in both cases and is the
+        authoritative source.  Injecting its current tensors here prevents legacy
+        checkpoint keys from silently overwriting that teacher and also makes a
+        compact student-only checkpoint complete under strict loading (required
+        when an FSDP2 ``accelerator.load_state`` resume loads the model weights).
+        """
+        current_state = super().state_dict()
+        teacher_state = {
+            key: value
+            for key, value in current_state.items()
+            if key.startswith(self._checkpoint_excluded_prefixes)
+        }
+        if teacher_state:
+            checkpoint_teacher_count = sum(
+                key.startswith(self._checkpoint_excluded_prefixes) for key in state_dict
+            )
+            state_dict = state_dict.copy()
+            state_dict.update(teacher_state)
+            logging.info(
+                "Preserving %d externally loaded WAN teacher tensors while loading "
+                "the student checkpoint (%d colliding checkpoint tensors ignored)",
+                len(teacher_state),
+                checkpoint_teacher_count,
+            )
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
     def get_optim_params(self) -> dict:
         return self.parameters()
 
