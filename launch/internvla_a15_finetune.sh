@@ -76,14 +76,39 @@ JOB_NAME="$(date +'%Y_%m_%d_%H_%M_%S')-${POLICY}-${DATASET_REPO_ID//[\/ ]/_}-${A
 OUTPUT_DIR="${BASE_OUTPUT_DIR}/${JOB_NAME}"
 
 
-ARGS=(
-    # ---- Accelerate / distributed ----
-    --multi_gpu
+# ---- Accelerate / distributed ----
+ACCELERATE_ARGS=(
     --num_processes="${NUM_PROCESSES}"
     --num_machines="${NODE_COUNT}"
     --machine_rank="${NODE_RANK}"
     --main_process_ip="${MASTER_ADDR}"
     --main_process_port="${MASTER_PORT}"
+)
+
+# FSDP2 sharding (opt-in: USE_FSDP2=true; default keeps the legacy DDP path).
+# Parameters mirror the reference FSDP2 recipe.
+USE_FSDP2="${USE_FSDP2:-false}"
+if [[ "${USE_FSDP2}" == "true" ]]; then
+    ACCELERATE_ARGS+=(
+        --use_fsdp
+        --fsdp_version=2
+        --fsdp_reshard_after_forward=false
+        --fsdp_auto_wrap_policy=TRANSFORMER_BASED_WRAP
+        --fsdp_transformer_layer_cls_to_wrap=Qwen3_5VisionBlock,Qwen3_5GatedDeltaNet,Qwen3_5MLP
+        --fsdp_state_dict_type=SHARDED_STATE_DICT
+        --fsdp_cpu_ram_efficient_loading=false
+        --fsdp_offload_params=false
+    )
+    # Keep the conditional Wan video-loss branch in lockstep across ranks
+    # (FSDP2 collectives deadlock if some ranks skip it).
+    export INTERNVLA_SYNC_VIDEO_BRANCH=1
+    echo "[InternVLA] FSDP2: enabled (reshard_after_forward=false, wrap=Qwen3_5VisionBlock,Qwen3_5GatedDeltaNet,Qwen3_5MLP)"
+elif (( NUM_PROCESSES > 1 )); then
+    ACCELERATE_ARGS=(--multi_gpu "${ACCELERATE_ARGS[@]}")
+fi
+
+ARGS=(
+    "${ACCELERATE_ARGS[@]}"
     src/lerobot/scripts/lerobot_train.py
 
     # ---- Output ----

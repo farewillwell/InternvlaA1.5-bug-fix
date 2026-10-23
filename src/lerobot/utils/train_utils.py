@@ -68,7 +68,8 @@ def save_checkpoint(
     policy: PreTrainedPolicy,
     optimizer: Optimizer,
     scheduler: LRScheduler | None = None,
-    data_stats: dict | None = None, 
+    data_stats: dict | None = None,
+    accelerator=None,
 ) -> None:
     """This function creates the following directory structure:
 
@@ -92,13 +93,71 @@ def save_checkpoint(
         policy (PreTrainedPolicy): The policy to save.
         optimizer (Optimizer | None, optional): The optimizer to save the state from. Defaults to None.
         scheduler (LRScheduler | None, optional): The scheduler to save the state from. Defaults to None.
+        accelerator: Optional Accelerator. When given and FSDP2 is active, a sharded FSDP2
+            checkpoint is written instead (see `save_checkpoint_fsdp2`).
     """
+    if accelerator is not None and getattr(accelerator, "is_fsdp2", False):
+        save_checkpoint_fsdp2(checkpoint_dir, step, cfg, policy, accelerator, data_stats=data_stats)
+        return
+
     pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
     policy.save_pretrained(pretrained_dir)
     cfg.save_pretrained(pretrained_dir)
     if data_stats is not None:
         write_json(serialize_dict(data_stats), pretrained_dir / 'stats.json')
     save_training_state(checkpoint_dir, step, optimizer, scheduler)
+
+
+def save_checkpoint_fsdp2(
+    checkpoint_dir: Path,
+    step: int,
+    cfg: TrainPipelineConfig,
+    policy: PreTrainedPolicy,
+    accelerator,
+    data_stats: dict | None = None,
+) -> None:
+    """FSDP2 checkpoint. MUST be called on ALL ranks (collective).
+
+    Directory structure:
+
+    005000/
+    ├── pretrained_model/          # same layout as the DDP path (rank 0 only)
+    │   ├── config.json
+    │   ├── model.safetensors      # full gathered fp32 weights, deployable as-is
+    │   ├── train_config.json
+    │   └── stats.json
+    └── training_state/
+        ├── training_step.json
+        └── accelerate_state/      # sharded model/optimizer/scheduler/rng for resume
+    """
+    from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+    from huggingface_hub.serialization import save_torch_state_dict
+
+    # Full state dict on CPU (broadcast from rank 0 to every rank).
+    state_dict = accelerator.get_state_dict(policy)
+
+    if accelerator.is_main_process:
+        pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
+        pretrained_dir.mkdir(parents=True, exist_ok=True)
+        unwrapped = accelerator.unwrap_model(policy)
+        unwrapped.config._save_pretrained(pretrained_dir)
+        save_torch_state_dict(
+            state_dict,
+            str(pretrained_dir),
+            filename_pattern=SAFETENSORS_SINGLE_FILE,
+            max_shard_size="500GB",  # force a single model.safetensors, same as the DDP path
+            metadata={"format": "pt"},
+        )
+        cfg.save_pretrained(pretrained_dir)
+        if data_stats is not None:
+            write_json(serialize_dict(data_stats), pretrained_dir / 'stats.json')
+        del state_dict
+    accelerator.wait_for_everyone()
+
+    # Sharded training state (model + optimizer + scheduler + rng) for resume — collective.
+    accelerator.save_state(checkpoint_dir / TRAINING_STATE_DIR / "accelerate_state")
+    if accelerator.is_main_process:
+        save_training_step(step, checkpoint_dir / TRAINING_STATE_DIR)
 
 
 def save_training_state(

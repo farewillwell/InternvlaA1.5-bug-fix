@@ -97,6 +97,17 @@ def sample_beta(alpha, beta, bsize, device):
     return dist.sample((bsize,))
 
 
+def _video_branch_sync_enabled() -> bool:
+    """Whether to keep the conditional Wan video branch synchronized across ranks.
+
+    Enabled via INTERNVLA_SYNC_VIDEO_BRANCH=1 (set by the FSDP2 launch path). The
+    default is off, leaving the legacy DDP behavior untouched.
+    """
+    import os
+
+    return os.environ.get("INTERNVLA_SYNC_VIDEO_BRANCH", "0") == "1"
+
+
 def make_att_2d_masks(pad_masks, att_masks):
     """Copied from big_vision."""
     if att_masks.ndim != 2:
@@ -1234,12 +1245,37 @@ class InternVLAA15(nn.Module):
             video_loss = torch.tensor(0.0, device=actions.device)
         else:
             has_video = video_mask.any() if video_mask is not None else (video_frames is not None)
+            if _video_branch_sync_enabled():
+                # FSDP2 executes sharded collectives inside the Wan branch, so every
+                # rank must enter/exit it together. A batch that is VQA-only on some
+                # ranks (video_mask all False) would otherwise desynchronize the
+                # collective stream and deadlock NCCL. Sync the decision across ranks.
+                import torch.distributed as _dist
+
+                if _dist.is_available() and _dist.is_initialized():
+                    _flag = torch.tensor(
+                        [1 if bool(has_video) else 0], device=actions.device, dtype=torch.int32
+                    )
+                    _dist.all_reduce(_flag, op=_dist.ReduceOp.MAX)
+                    has_video = bool(_flag.item())
             if has_video:
                 learnable_out = self.get_learnable_token_output(suffix_out).to(dtype=torch.float32)
                 if video_mask is not None:
-                    video_frames = video_frames[video_mask]
-                    learnable_out = learnable_out[video_mask]
-                video_loss = self._compute_video_loss(video_frames, learnable_out)
+                    if video_mask.any():
+                        video_frames = video_frames[video_mask]
+                        learnable_out = learnable_out[video_mask]
+                        video_loss = self._compute_video_loss(video_frames, learnable_out)
+                    else:
+                        # Global-sync case: this rank has no video samples but other
+                        # ranks do. Run the branch on a zeroed dummy sample so the
+                        # collectives and backward hooks stay aligned; the zero weight
+                        # guarantees zero loss/gradient contribution, i.e. the same
+                        # semantics as skipping the branch under DDP.
+                        dummy_frames = torch.zeros_like(video_frames[:1])
+                        dummy_out = learnable_out[:1] * 0.0
+                        video_loss = self._compute_video_loss(dummy_frames, dummy_out) * 0.0
+                else:
+                    video_loss = self._compute_video_loss(video_frames, learnable_out)
             else:
                 video_loss = torch.tensor(0.0, device=actions.device)
 

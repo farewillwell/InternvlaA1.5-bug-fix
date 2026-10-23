@@ -87,7 +87,13 @@ def update_policy(
 
     # Let accelerator handle mixed precision
     with accelerator.autocast():
-        loss, output_dict = policy.forward(batch)
+        if getattr(accelerator, "is_fsdp2", False):
+            # FSDP2 relies on the root module's __call__ hooks to unshard root-level
+            # params (embeddings, patch_embed, ...); calling .forward() directly
+            # bypasses them and fails with mixed Tensor/DTensor errors.
+            loss, output_dict = policy(batch)
+        else:
+            loss, output_dict = policy.forward(batch)
 
 
     # Use accelerator's backward method
@@ -156,13 +162,22 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     # We set step_scheduler_with_optimizer=False to prevent accelerate from adjusting the lr_scheduler steps based on the num_processes
     # We set find_unused_parameters=True to handle models with conditional computation
     if accelerator is None:
-        from accelerate.utils import DistributedDataParallelKwargs
+        import os as _os
 
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-        # ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-        accelerator = Accelerator(step_scheduler_with_optimizer=False, kwargs_handlers=[ddp_kwargs])
+        if _os.environ.get("ACCELERATE_USE_FSDP", "false").lower() in ("1", "true", "yes"):
+            # FSDP: DDP-specific kwargs (find_unused_parameters) do not apply.
+            accelerator = Accelerator(step_scheduler_with_optimizer=False)
+        else:
+            from accelerate.utils import DistributedDataParallelKwargs
+
+            ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+            # ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+            accelerator = Accelerator(step_scheduler_with_optimizer=False, kwargs_handlers=[ddp_kwargs])
 
     init_logging(accelerator=accelerator)
+
+    # FSDP2 changes checkpoint/resume semantics (sharded state, collective saves).
+    is_fsdp2 = getattr(accelerator, "is_fsdp2", False)
 
     # Determine if this is the main process (for logging and checkpointing)
     # When using accelerate, only the main process should log to avoid duplicate outputs
@@ -245,7 +260,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     step = 0  # number of policy updates (forward + backward + optim)
 
-    if cfg.resume:
+    if cfg.resume and not is_fsdp2:
         step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
 
     if cfg.dataset.dist_loading:
@@ -281,6 +296,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             policy, optimizer, dataloader, lr_scheduler
         )
     dl_iter = cycle(dataloader)
+
+    if cfg.resume and is_fsdp2:
+        # FSDP2: state must be loaded AFTER prepare (params are sharded during prepare).
+        from lerobot.utils.constants import TRAINING_STATE_DIR as _TRAINING_STATE_DIR
+        from lerobot.utils.train_utils import load_training_step as _load_training_step
+
+        accelerator.load_state(cfg.checkpoint_path / _TRAINING_STATE_DIR / "accelerate_state")
+        step = _load_training_step(cfg.checkpoint_path / _TRAINING_STATE_DIR)
+        if is_main_process:
+            logging.info(f"Resumed FSDP2 training state from {cfg.checkpoint_path} at {step=}")
 
     policy.train()
 
@@ -373,7 +398,27 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:
-            if is_main_process:
+            if is_fsdp2:
+                # FSDP2 checkpointing is collective (sharded state save) -> all ranks enter.
+                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+                if is_main_process:
+                    logging.info(f"Checkpoint policy after step {step}")
+                    logging.info(colored("Checkpoint saved at:", "cyan", attrs=["bold"]) + f" {checkpoint_dir}")
+                save_checkpoint(
+                    checkpoint_dir=checkpoint_dir,
+                    step=step,
+                    cfg=cfg,
+                    policy=policy,
+                    optimizer=optimizer,
+                    scheduler=lr_scheduler,
+                    data_stats=data_stats,
+                    accelerator=accelerator,
+                )
+                if is_main_process:
+                    update_last_checkpoint(checkpoint_dir)
+                    if wandb_logger:
+                        wandb_logger.log_policy(checkpoint_dir)
+            elif is_main_process:
                 logging.info(f"Checkpoint policy after step {step}")
                 checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
                 logging.info(colored("Checkpoint saved at:", "cyan", attrs=["bold"]) + f" {checkpoint_dir}")

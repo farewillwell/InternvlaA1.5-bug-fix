@@ -42,6 +42,13 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--root",
+        type=str,
+        default=None,
+        help="Optional local dataset root. Use this for a dataset outside HF_LEROBOT_HOME.",
+    )
+
+    parser.add_argument(
         "--output_dir",
         type=str,
         default=None,
@@ -57,7 +64,7 @@ class RunningStats:
     def __init__(self):
         self._count = 0
         self._mean = None
-        self._mean_of_squares = None
+        self._m2 = None
         self._min = None
         self._max = None
 
@@ -68,7 +75,7 @@ class RunningStats:
         Args:
             batch (torch.Tensor): shape [..., d]
         """
-        batch = batch.to(torch.float32)
+        batch = batch.to(torch.float64)
 
         if batch.ndim == 1:
             batch = batch[:, None]
@@ -77,23 +84,22 @@ class RunningStats:
             batch = batch.reshape(-1, batch.shape[-1])  
         count = batch.shape[0]
         mean = batch.mean(dim=0)
-        mean_sq = (batch ** 2).mean(dim=0)
+        m2 = ((batch - mean) ** 2).sum(dim=0)
         min_ = batch.min(dim=0).values
         max_ = batch.max(dim=0).values
 
         if self._count == 0:
             self._count = count
             self._mean = mean
-            self._mean_of_squares = mean_sq
+            self._m2 = m2
             self._min = min_
             self._max = max_
         else:
             total = self._count + count
-            w_old = self._count / total
-            w_new = count / total
+            delta = mean - self._mean
 
-            self._mean = w_old * self._mean + w_new * mean
-            self._mean_of_squares = w_old * self._mean_of_squares + w_new * mean_sq
+            self._mean = self._mean + delta * count / total
+            self._m2 = self._m2 + m2 + delta**2 * self._count * count / total
             self._min = torch.minimum(self._min, min_)
             self._max = torch.maximum(self._max, max_)
             self._count = total
@@ -102,8 +108,7 @@ class RunningStats:
         """Return mean, std, min, max."""
         if self._count == 0:
             raise ValueError("No data has been added yet.")
-        var = self._mean_of_squares - self._mean ** 2
-        std = torch.sqrt(torch.clamp(var, min=0.0))
+        std = torch.sqrt(self._m2 / self._count)
         return {
             "min": self._min.tolist(),
             "max": self._max.tolist(),
@@ -118,7 +123,7 @@ def compute_norm_stats(cfg):
     torch.backends.cuda.matmul.allow_tf32 = True
 
     print(f"---------- compute statistics for dataset: {cfg.repo_id} ----------")
-    dataset = LeRobotDataset(cfg.repo_id)
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
 
     from_ids = np.asarray(dataset.meta.episodes['dataset_from_index'])
     to_ids = np.asarray(dataset.meta.episodes['dataset_to_index'])
